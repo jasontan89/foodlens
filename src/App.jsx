@@ -46,8 +46,11 @@ function calcTargets(p) {
 // ── Rule-based scoring engine ────────────────────────────────────────────────
 function scoreNutrition(n, additiveCount=0) {
   const v = k => n[k]?.value!=null ? Number(n[k].value) : null;
+  // curve() now returns null for missing data instead of a fake "50" —
+  // a missing value is unknown, not "moderate". The caller decides how
+  // to handle nulls (exclude from weighted average, see below).
   const curve = (val,breaks,scores) => {
-    if (val===null) return 50;
+    if (val===null) return null;
     for (let i=0;i<breaks.length;i++) if (val<=breaks[i]) return scores[i];
     return scores[scores.length-1];
   };
@@ -57,14 +60,34 @@ function scoreNutrition(n, additiveCount=0) {
   const fibreS  = curve(v("dietaryFibre"), [1,3,6,10],      [10,30,55,80,100]);
   const protS   = curve(v("protein"),      [3,6,10,15,20],  [10,25,50,75,100]);
   const novaS   = additiveCount===0?100:additiveCount<=1?75:additiveCount<=3?45:15;
-  let score = sugarS*.25+satFatS*.20+sodiumS*.20+fibreS*.15+protS*.10+novaS*.10;
+
+  // Re-normalize weights across only the components we actually have data for.
+  // E.g. if sugar+satFat+sodium+protein+nova are known but fibre is missing,
+  // fibre's 15% weight is dropped and the other 5 are scaled up to fill 100%
+  // instead of fibre silently contributing a fake "moderate" 50 points.
+  const components = [
+    { score: sugarS,  weight: 25 },
+    { score: satFatS, weight: 20 },
+    { score: sodiumS, weight: 20 },
+    { score: fibreS,  weight: 15 },
+    { score: protS,   weight: 10 },
+    { score: novaS,   weight: 10 }, // additiveCount is always known, never null
+  ];
+  const known = components.filter(c => c.score !== null);
+  const knownWeightTotal = known.reduce((sum,c) => sum + c.weight, 0);
+  const dataCompleteness = knownWeightTotal / 100; // 1.0 = full data, lower = more gaps
+
+  let score = knownWeightTotal > 0
+    ? known.reduce((sum,c) => sum + c.score * (c.weight / knownWeightTotal), 0)
+    : 50; // total fallback only if literally everything is missing
+
   if (v("transFat")>0) score-=12;
   score = Math.max(0,Math.min(100,Math.round(score)));
   const grade      = score>=80?"A":score>=60?"B":score>=40?"C":score>=20?"D":"F";
   const gradeColor = score>=80?"#2F855A":score>=60?"#38A169":score>=40?C.amber:C.red;
   const label      = score>=80?"Excellent":score>=60?"Good":score>=40?"Moderate":score>=20?"Poor":"Avoid";
   const emoji      = score>=80?"🟢":score>=60?"🟡":score>=40?"🟠":"🔴";
-  return { overall:score, grade, gradeColor, label, emoji,
+  return { overall:score, grade, gradeColor, label, emoji, dataCompleteness,
     breakdown:[
       {name:"Sugar",        score:sugarS,  weight:"25%"},
       {name:"Saturated fat",score:satFatS, weight:"20%"},
@@ -238,9 +261,15 @@ function ProfileScreen({ profile, onSave }) {
 // SCANNER STEPS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── FIX: removed capture="environment" so mobile shows Camera + Gallery + Files
+// FIX: a single <input> with no `capture` attribute does NOT reliably show a
+// chooser with both Camera and Gallery on mobile browsers — many default
+// straight to the gallery, silently hiding the camera option. The reliable
+// pattern is two separate inputs: one forces the camera via
+// capture="environment", the other (no capture attr) opens gallery/files.
+// Exposing them as two explicit buttons removes the ambiguity entirely.
 function UploadStep({ onImage }) {
-  const inputRef=useRef();
+  const cameraInputRef=useRef();
+  const galleryInputRef=useRef();
   const [dragging,setDragging]=useState(false);
   const [error,setError]=useState("");
 
@@ -268,27 +297,45 @@ function UploadStep({ onImage }) {
         </p>
       </div>
 
-      <div onClick={()=>inputRef.current.click()}
+      {/* Two explicit action buttons — removes ambiguity around what the OS chooser will show */}
+      <div style={{ display:"flex", gap:8, marginBottom:14 }}>
+        <button onClick={()=>cameraInputRef.current.click()} style={{
+          flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:6,
+          padding:"20px 12px", borderRadius:16, cursor:"pointer",
+          border:`2px solid ${C.lime}`, background:C.mint, fontFamily:"inherit" }}>
+          <span style={{ fontSize:28 }}>📷</span>
+          <span style={{ fontSize:13, fontWeight:700, color:C.green }}>Take Photo</span>
+          <span style={{ fontSize:10, color:C.slateL }}>Opens camera</span>
+        </button>
+        <button onClick={()=>galleryInputRef.current.click()} style={{
+          flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:6,
+          padding:"20px 12px", borderRadius:16, cursor:"pointer",
+          border:`2px solid ${C.border}`, background:C.surface, fontFamily:"inherit" }}>
+          <span style={{ fontSize:28 }}>🖼️</span>
+          <span style={{ fontSize:13, fontWeight:700, color:C.green }}>Choose Photo</span>
+          <span style={{ fontSize:10, color:C.slateL }}>Gallery or Files</span>
+        </button>
+      </div>
+
+      {/* Desktop drag & drop zone — secondary path, still useful on desktop */}
+      <div onClick={()=>galleryInputRef.current.click()}
         onDragOver={e=>{e.preventDefault();setDragging(true);}}
         onDragLeave={()=>setDragging(false)}
         onDrop={e=>{e.preventDefault();setDragging(false);handleFile(e.dataTransfer.files[0]);}}
         style={{ border:`2px dashed ${dragging?C.lime:C.border}`, borderRadius:16,
-          padding:"36px 24px", textAlign:"center", cursor:"pointer",
+          padding:"18px 24px", textAlign:"center", cursor:"pointer",
           background:dragging?C.mint:C.bg, transition:"all 0.2s", marginBottom:14 }}>
-        <div style={{ fontSize:36, marginBottom:10 }}>📷</div>
-        <p style={{ margin:"0 0 6px", fontWeight:700, color:C.green, fontSize:15 }}>
-          Tap to upload a photo
-        </p>
-        <p style={{ margin:"0 0 4px", fontSize:12, color:C.slateL }}>
-          📱 Mobile: choose Camera, Gallery, or Files
-        </p>
         <p style={{ margin:0, fontSize:12, color:C.slateL }}>
-          💻 Desktop: drag & drop or click to browse
+          💻 Desktop: or drag & drop a photo here
         </p>
       </div>
 
-      {/* No capture="environment" — lets OS show full chooser on mobile */}
-      <input ref={inputRef} type="file" accept="image/*"
+      {/* Camera input — capture="environment" forces the rear camera to open directly */}
+      <input ref={cameraInputRef} type="file" accept="image/*" capture="environment"
+        style={{ display:"none" }} onChange={e=>handleFile(e.target.files[0])} />
+
+      {/* Gallery input — no capture attr, opens photo library / file browser */}
+      <input ref={galleryInputRef} type="file" accept="image/*"
         style={{ display:"none" }} onChange={e=>handleFile(e.target.files[0])} />
 
       {error&&<div style={{ background:C.redL, border:`1px solid ${C.red}`, borderRadius:10,
@@ -570,7 +617,7 @@ function AIScoreTab({ aiAnalysis }) {
           <span style={{ fontSize:8, color:"rgba(255,255,255,0.7)" }}>AI</span>
         </div>
         <div>
-          <div style={{ fontSize:11, color:"rgba(255,255,255,0.5)", marginBottom:2 }}>🧠 Gemini 2.5 Flash</div>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,0.5)", marginBottom:2 }}>🧠 Gemini 3.1 Flash Lite</div>
           <div style={{ fontSize:18, fontWeight:900, color:"#fff" }}>{a.aiScore||0}/100
             <span style={{ fontSize:12, fontWeight:400, marginLeft:6 }}>
               {a.aiScore>=80?"🟢":a.aiScore>=60?"🟡":a.aiScore>=40?"🟠":"🔴"} {a.aiLabel}

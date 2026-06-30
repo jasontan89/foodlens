@@ -133,7 +133,7 @@ function parseJSON(raw) {
 
 async function callGemini(apiKey, parts) {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -142,6 +142,11 @@ async function callGemini(apiKey, parts) {
         generationConfig: {
           temperature: 0.1,
           maxOutputTokens: 8192,
+          // Flash-Lite models support explicit thinking levels (minimal/low/medium/high).
+          // "low" gives enough reasoning for nutrition judgment + JSON structuring
+          // without the latency cost of "medium"/"high" — keeps us well under
+          // Vercel's 10s timeout on the free plan.
+          thinkingConfig: { thinkingLevel: "low" },
         },
       }),
     }
@@ -189,6 +194,51 @@ export default async function handler(req, res) {
     ]);
 
     const result = parseJSON(raw);
+
+    // ── Normalize nutritionPer100g — Gemini's JSON mode isn't schema-enforced,
+    // so it can occasionally drift (string numbers, missing unit, wrong nesting).
+    // This guarantees every field has the exact { value: number|null, unit: string } shape
+    // the frontend expects, regardless of what Gemini actually returned.
+    const NUTRIENT_UNITS = {
+      calories: "kcal", protein: "g", totalFat: "g", saturatedFat: "g",
+      transFat: "g", totalCarbs: "g", sugars: "g", dietaryFibre: "g", sodium: "mg",
+    };
+    const rawNutrition = result.nutritionPer100g || {};
+    const normalizedNutrition = {};
+    let missingCount = 0;
+
+    for (const [key, defaultUnit] of Object.entries(NUTRIENT_UNITS)) {
+      const field = rawNutrition[key];
+      let value = null;
+
+      if (field && typeof field === "object" && field.value !== undefined) {
+        // Expected shape: { value: ..., unit: ... }
+        value = field.value;
+      } else if (typeof field === "number" || typeof field === "string") {
+        // Gemini sometimes flattens to a bare number/string instead of an object
+        value = field;
+      }
+
+      // Coerce to a real number, or null if it can't be parsed
+      if (value !== null && value !== undefined && value !== "") {
+        const num = Number(value);
+        value = Number.isFinite(num) ? num : null;
+      } else {
+        value = null;
+      }
+
+      if (value === null) missingCount++;
+      normalizedNutrition[key] = { value, unit: (field && field.unit) || defaultUnit };
+    }
+
+    result.nutritionPer100g = normalizedNutrition;
+
+    if (missingCount > 0) {
+      console.warn(`nutritionPer100g had ${missingCount}/9 fields missing or malformed after normalization`);
+    }
+    if (missingCount >= 7) {
+      console.error("Nutrition extraction likely failed - raw response:", JSON.stringify(rawNutrition).substring(0, 300));
+    }
 
     // Safety check — if aiAnalysis missing from response, set null
     // so frontend falls back gracefully instead of crashing
